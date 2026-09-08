@@ -1,2 +1,5 @@
 # Moccasin-Terrace-Conceptual-Groundwater-Model-MODFLOW6
 This project constructs a conceptual groundwater model using MODFLOW6 and FloPy focused on the Moccasin Terrace. The Moccasin Terrace is located with the Judith River Watershed near Moccasin, Montana. This is a proof of concept model that is not calibrated and is still under development. 
+
+The data structure is organized into 4 main sections 01_input, 02_protocol, 03_increment, and 04_product. Note that 04_product does not exist yet as there are not yet any final products such as reports, figures, maps etc. The 01_input contains raw data such as MBMG GWIC well information or USGS NHD information. 02_protocol contains the main workflow files such as .Rmd files which generate figures and reports. The 03_increment contains works in progress such as incremental figures, reports, or maps. Under the main parent folder the .Rproj file sets the directory to the parent directory so the .Rmd file contained in 02_protocol can be used easily
+using relative paths. Then of course there is the README.md file which describes the project briefly and outlines the data structure and how it can be used (this document). 
