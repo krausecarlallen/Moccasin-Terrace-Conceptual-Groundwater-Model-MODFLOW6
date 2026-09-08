@@ -1,0 +1,1235 @@
+---
+title: "Moccasin Terrace Modflow6"
+date: "2026-09-07"
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+    number_sections: true
+
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "../../03_increment") })
+---
+# Project overview
+
+This project is intended to setup a basic modflow6 model on the Moccasin
+terrace as a proof of concept. The model currently is not intended to serve as 
+a calibrated and accurate groundwater model suitable for solute fate and 
+transport questions. Notably considering the very flat nature of the terrace
+a shale boundary bottom layer or interpolated shale boundary is needed to produce
+a realistic head contour plot.The basic model skeleton runs without incorporating
+recharge or discharge into the model which currently results in model failure. 
+This model is still under development. 
+
+The main motivation of this proof of concept model is to try and examine 
+simulated groundwater flows around the M1 monitoring well on the Moccasin terrace
+to try and understand what the contributing area to this might be. 
+
+```{r setup, include=FALSE}
+
+library(reticulate)
+use_python("C:/Users/kraus/anaconda3/python.exe", required = TRUE)
+py_config()
+knitr::opts_chunk$set(
+  echo = TRUE,
+  results = "hide", ## prevent text in html
+  warning = FALSE,
+  message = FALSE)
+
+```
+
+```{r Github setup, include = FALSE}
+
+file.create("../../.gitignore")
+
+gitignore_lines <- c(
+  "GWIC_GDB", 
+  "GWIC_Shapefile",
+  "USGS_NHD",
+  "Moccasin_terrace_modflow6", ## Arcgis pro folder
+  ".RData",
+  ".Rhistory",
+  ".Ruserdata",
+  ".Rproj.user/",
+  "Moccasin_Terrace_Modflow6_20260420.Rmd", ## old version rmd file
+  "Moccasin_Terrace_Modflow6_20260830.Rmd", ## old version rmd file
+  "Moccasin_Terrace_model.py", ## old python file script
+  "Moccasin_Terrace_model_20260419.py", ## old python file script
+  "03_increment/20260415", ## old folder for 03_increment,
+  ".gitignore", ## don't need to show what wasn't included on Github
+  "__pycache__/",
+  "*.py[cod]"
+)
+
+writeLines(gitignore_lines, "../../.gitignore")
+```
+
+# Libaries and path setup
+```{python libaries and paths}
+
+from pathlib import Path
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import flopy
+from flopy.utils import Raster
+from flopy.utils.gridintersect import GridIntersect
+import rasterio
+import rasterstats  # needed by flopy Raster resampling
+import pandas as pd
+from shapely.geometry import Point
+from scipy.interpolate import griddata
+import rasterio
+from rasterio.transform import from_origin
+
+# 1. Directory and input setup
+project_dir = Path(r"D:/MODFLOW6/Moccasin_terrace_project")
+input_dir = project_dir / "01_input"
+model_ws = project_dir / "03_increment" / "20260907"
+model_ws.mkdir(parents=True, exist_ok=True)
+
+dem_path = input_dir / "Moccasin_DEM_30m.tif"
+bnd_path = input_dir / "Moccasin_Terrace_filled_boundary.shp"
+nhd_path = input_dir / "USGS_NHD"/ "Judith River" / "Shape" / "NHDFlowline.shp"
+M1_well_path = input_dir / "M1 Well Location.xlsx"
+red_shed_lake_path = input_dir / "Red_Shed_Lake.shp"
+
+```
+
+# DEM and shapefile import
+```{python DEM and shapefile boundaries}
+
+## Read boundary and Red Shed Lake
+boundary = gpd.read_file(bnd_path)
+red_shed_lake = gpd.read_file(red_shed_lake_path)
+
+with rasterio.open(dem_path) as src:
+    Moccasin_dem = src.read(1)
+    dem_crs = src.crs
+    transform = src.transform
+
+print("Boundary CRS:", boundary.crs)
+print("Red Shed Lake CRS:", red_shed_lake.crs)
+print("DEM CRS:", dem_crs)
+
+## Reproject Red Shed Lake if necessary
+if red_shed_lake.crs != dem_crs:
+    red_shed_lake = red_shed_lake.to_crs(dem_crs)
+
+print("Red Shed Lake CRS after reprojection:", red_shed_lake.crs)
+
+# raster bounds for plotting
+height, width = Moccasin_dem.shape
+left, top_raster = transform * (0, 0)
+right, bottom = transform * (width, height)
+
+
+## DEM + boundary + Red Shed Lake check
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+ax.imshow(
+    Moccasin_dem,
+    cmap="terrain",
+    extent=[left, right, bottom, top_raster]
+)
+
+boundary.boundary.plot(
+    ax=ax,
+    color="red",
+    linewidth=1,
+    label="Moccasin Boundary"
+)
+
+red_shed_lake.plot(
+    ax=ax,
+    color="blue",
+    edgecolor="black",
+    alpha=0.5,
+    label="Red Shed Lake"
+)
+
+ax.set_title("DEM + Moccasin Boundary + Red Shed Lake")
+ax.set_aspect("equal")
+ax.legend()
+
+plt.show()
+
+```
+
+# Grid construction 
+```{python grid construction}
+
+## Construct model grid
+cellsize = 100.0  # meters
+
+xmin, ymin, xmax, ymax = boundary.total_bounds
+Lx = xmax - xmin
+Ly = ymax - ymin
+
+ncol = int(np.ceil(Lx / cellsize))
+nrow = int(np.ceil(Ly / cellsize))
+
+delr = np.full(ncol, cellsize)
+delc = np.full(nrow, cellsize)
+
+# Structured Grid for QC, intersection, and raster resampling
+modelgrid = flopy.discretization.StructuredGrid(
+    delr=delr,
+    delc=delc,
+    top=np.zeros((nrow, ncol)),
+    botm=np.full((1, nrow, ncol), -10.0),
+    xoff=xmin,
+    yoff=ymin,
+    crs=dem_crs,
+)
+
+## Boundary and grid check
+fig, ax = plt.subplots(figsize=(8, 6))
+pmv = flopy.plot.PlotMapView(modelgrid=modelgrid, ax=ax)
+pmv.plot_grid(colors="black", linewidth=0.5)
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+ax.set_title("Moccasin Boundary + Model Grid")
+ax.set_aspect("equal")
+plt.show()
+
+print(f"Total cells: {nrow * ncol}")
+```
+
+# Cell activation
+```{python activating grid cells}
+
+## Create idomain from boundary
+model_poly = boundary.union_all()
+
+idomain = np.zeros((1, nrow, ncol), dtype=int)
+
+ix = GridIntersect(modelgrid)
+result = ix.intersect(model_poly)
+
+for cellid in result.cellids:
+    r, c = cellid
+    idomain[0, r, c] = 1
+
+## active cell check
+fig, ax = plt.subplots(figsize=(8, 6))
+pmv = flopy.plot.PlotMapView(modelgrid=modelgrid, ax=ax)
+pmv.plot_array(idomain[0], masked_values=[0])
+pmv.plot_grid(alpha=0.15)
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+ax.set_title("Active Cells (idomain)")
+ax.set_aspect("equal")
+plt.show()
+
+```
+
+
+```{python Red Shed Lake cells for CHD}
+# Identify Red Shed Lake cells for CHD
+
+ix = GridIntersect(modelgrid)
+
+lake_result = ix.intersect(
+    red_shed_lake.union_all()
+)
+
+lake_cells = []
+
+for cellid in lake_result.cellids:
+    r, c = cellid
+
+    if idomain[0, r, c] == 1:
+        lake_cells.append((0, r, c))
+
+print("Red Shed Lake cells:", len(lake_cells))
+```
+
+# DEM resampling
+```{python resampled DEM to model domain}
+
+## Resample DEM to model grid
+raster = Raster.load(str(dem_path))
+
+top = raster.resample_to_grid(
+    modelgrid,
+    band=raster.bands[0],
+    method="nearest",
+    extrapolate_edges=True,
+)
+
+top = np.asarray(top, dtype=float)
+
+active_nan = (idomain[0] == 1) & np.isnan(top)
+print("Active cells with NaN top:", active_nan.sum())
+
+# DEM in active domain only
+top_active = np.where(idomain[0] == 1, top, np.nan)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+pmv = flopy.plot.PlotMapView(modelgrid=modelgrid, ax=ax)
+quad = pmv.plot_array(top_active)
+pmv.plot_grid(alpha=0.15)
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+plt.colorbar(quad, ax=ax, label="Top elevation")
+ax.set_title("Resampled DEM in Active Model Domain")
+ax.set_aspect("equal")
+plt.show()
+```
+
+
+```{python bottom elevation check}
+
+## model layers, thickness
+nlay = 1
+thickness = 10.0  # meters, placeholder first-pass thickness
+
+# Fill inactive cells so DIS gets a complete numeric array
+fill_top = np.nanmin(top)
+top_dis = np.where(np.isnan(top_active), fill_top, top_active)
+
+botm = np.zeros((nlay, nrow, ncol), dtype=float)
+botm[0] = top_dis - thickness
+
+if np.any(botm[0] >= top_dis):
+    raise ValueError("Bottom elevation is not below top everywhere.")
+
+# bottom elevation check
+fig, ax = plt.subplots(figsize=(8, 6))
+pmv = flopy.plot.PlotMapView(modelgrid=modelgrid, ax=ax)
+quad = pmv.plot_array(np.where(idomain[0] == 1, botm[0], np.nan))
+pmv.plot_grid(alpha=0.15)
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+plt.colorbar(quad, ax=ax, label="Bottom elevation")
+ax.set_title("Layer 1 Bottom Elevation")
+ax.set_aspect("equal")
+plt.show()
+
+```
+
+# NHD flowlines addition
+```{python DEM shapefile boundaries and USGS NHD flowlines}
+
+## adding in USGS NHD flowlines
+flowlines = gpd.read_file(nhd_path)
+print("Flowlines CRS:", flowlines.crs) ## checks starting crs 
+## reproject if needed
+if flowlines.crs != dem_crs: ## if crs is different than dem crs convert it
+    flowlines = flowlines.to_crs(dem_crs)
+print("Flowlines CRS:", flowlines.crs) ## check to make sure crs converted
+
+#$ clip to Moccasin boundary
+flowlines_clip = gpd.clip(flowlines, boundary)
+
+print(f"Original flowlines: {len(flowlines)}")
+print(f"Clipped flowlines: {len(flowlines_clip)}")
+
+## DEM, boundary, clipped flowlines check
+fig, ax = plt.subplots(figsize=(8, 6))
+
+ax.imshow(
+    Moccasin_dem,
+    cmap="terrain",
+    extent=[left, right, bottom, top_raster]
+)
+
+boundary.boundary.plot(ax=ax, color="red", linewidth=1, label="Moccasin boundary")
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2, label="NHD flowlines")
+
+red_shed_lake.plot(
+    ax=ax,
+    color="red",
+    edgecolor="black",
+    alpha=0.5,
+    label="Red Shed Lake"
+)
+
+ax.set_title("DEM + Moccasin Boundary + NHD Flowlines + Red Shed Lake")
+ax.set_aspect("equal")
+ax.legend()
+
+plt.show()
+
+
+## add in well location
+
+df = pd.read_excel(M1_well_path) ## reading in well location data
+print(df.head())
+
+well_gdf = gpd.GeoDataFrame(
+    df,
+    geometry=[Point(xy) for xy in zip(df["longDDS"], df["latDDS"])],
+    crs="EPSG:4326"
+)
+
+well_gdf = well_gdf.to_crs(dem_crs) ## converting crs
+
+well_gdf.plot(
+    ax=ax,
+    color="orange",
+    edgecolor="black",
+    markersize=60,
+    marker="o"
+)
+
+## plot of DEM, boundary, USGS flowlines and monitoring well 
+fig, ax = plt.subplots(figsize=(8, 6))
+
+ax.imshow(
+    Moccasin_dem,
+    cmap="terrain",
+    extent=[left, right, bottom, top_raster]
+)
+
+boundary.boundary.plot(ax=ax, color="red", linewidth=1, label="Moccasin boundary")
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2, label="NHD flowlines")
+
+well_gdf.plot(
+    ax=ax,
+    color="orange",
+    edgecolor="black",
+    markersize=60,
+    marker="o",
+    label="Monitoring well"
+)
+
+ax.set_title("DEM + Moccasin Boundary + NHD Flowlines + Monitoring Well")
+ax.set_aspect("equal")
+
+plt.show()
+
+```
+
+# GWIC wells
+```{python GWIC wells }
+
+# GWIC wells: read, reproject, clip to Moccasin boundary
+gwic_path = input_dir / "GWIC_Shapefile" / "GWIC_Wells.shp"
+
+# read GWIC well points
+gwic = gpd.read_file(gwic_path)
+
+print("GWIC CRS:", gwic.crs)
+print("GWIC fields:", gwic.columns.tolist())
+
+# reproject to DEM/model CRS if needed
+if gwic.crs != dem_crs:
+    gwic = gwic.to_crs(dem_crs)
+print("GWIC CRS:", gwic.crs)
+
+# clip wells to Moccasin boundary
+gwic_clip = gpd.clip(gwic, boundary)
+
+print("GWIC wells in Moccasin boundary:", len(gwic_clip))
+
+## copy of useful GWIC fields 
+gwic_well_list = gwic_clip[
+    [
+        "gwicid",
+        "site_name",
+        "latitude",
+        "longitude",
+        "geomethod",
+        "altitude",
+        "site_type",
+        "township",
+        "range",
+        "section",
+        "qsection",
+        "county",
+        "notes",
+    ]
+].copy()
+
+gwic_well_list
+
+# Plot GWIC wells inside Moccasin boundary
+fig, ax = plt.subplots(figsize=(8, 6))
+
+ax.imshow(
+    Moccasin_dem,
+    cmap="terrain",
+    extent=[left, right, bottom, top_raster]
+)
+
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2)
+gwic_clip.plot(ax=ax, color="black", markersize=10)
+
+ax.set_title("GWIC Wells within Moccasin Boundary")
+ax.set_aspect("equal")
+
+plt.show()
+
+# Export well list for manual GWIC log review
+gwic_out_csv = model_ws / "Moccasin_GWIC_wells_inside_boundary.csv"
+gwic_well_list.to_csv(gwic_out_csv, index=False)
+
+gwic_out_csv
+
+
+```
+
+The overall assessment for suitability in constructing an interpolated shale boundary
+based on well coverage is decidedly suspect. There is some clumping of wells deemed suitable
+for this purpose and many more wells that have no record or the confining boundary of the 
+perched aquifer is more uncertain (maybe wells). The northeast section of the terrace
+has very little in terms of usable GWIC well logs. The most important point is that
+around the M1 monitoring well there is very little well log data with which to 
+interpolate a confining layer. With static water level measurements, we could
+probably construct equipotential lines for head contours but right now the 
+confining layer interpolation is mostly only useful as a conceptual for groundwater
+flow paths. 
+
+# Bottom boundary interpolation
+```{python GWIC well usability for bottom interpolation}
+## importing in modified csv with rough boundary depths in feet 
+
+gwic_csv = model_ws / "Moccasin_GWIC_wells_inside_boundary_bottom_depth_edit.csv"
+gwic_labels = pd.read_csv(gwic_csv)
+
+# create geometry from lat/long
+gwic_gdf = gpd.GeoDataFrame(
+    gwic_labels,
+    geometry=gpd.points_from_xy(gwic_labels["longitude"], gwic_labels["latitude"]),
+    crs="EPSG:4326"  # lat/long CRS
+)
+# project to DEM CRS
+gwic_gdf = gwic_gdf.to_crs(dem_crs)
+
+gwic_gdf.head()
+
+## check columns listed
+gwic_labels.columns.tolist()
+## strip white space and 
+gwic_gdf["usable"] = gwic_gdf["usable"].str.strip().str.capitalize()
+## check for trailing spaces
+gwic_gdf["usable"].value_counts(dropna=False)
+
+
+## checking which wells make sense to work with, which are a maybe and which are not usable
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# DEM
+ax.imshow(
+    Moccasin_dem,
+    cmap="terrain",
+    extent=[left, right, bottom, top_raster]
+)
+
+# boundary + streams
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2)
+
+gwic_gdf[gwic_gdf["usable"] == "Yes"].plot(
+    ax=ax, color="lime", markersize=40, label="Yes"
+)
+
+gwic_gdf[gwic_gdf["usable"] == "Maybe"].plot(
+    ax=ax, color="orange", markersize=30, label="Maybe"
+)
+
+gwic_gdf[gwic_gdf["usable"] == "No"].plot(
+    ax=ax, color="gray", markersize=15, label="No"
+)
+
+ax.legend()
+ax.set_title("GWIC Well Classification (Moccasin Boundary)")
+ax.set_aspect("equal")
+
+plt.show()
+
+```
+
+Seeing some low values around 2-5 meter depths to assumed confining material 
+but a general pattern is emerging for ~7-12 meters. Worth a recheck on the 2-5.
+I did reassign the MSU CARC well 1929 a depth of 28ft. This is uncertain but overburden
+gravel and boulders is 0-28 ft. 
+Overall, the depth to the assumed confining material based 
+on GWIC well log lithologic descriptions is promising as a first pass. 
+
+```{python GWIC wells with labels}
+
+## labeling depths to assumed confining layer here
+
+# convert confining boundary depth from ft to m
+gwic_gdf["Confining_layer_boundary_ft"] = pd.to_numeric(
+    gwic_gdf["Confining_layer_boundary_ft"],
+    errors="coerce"
+)
+
+gwic_gdf["Confining_layer_boundary_m"] = (
+    gwic_gdf["Confining_layer_boundary_ft"] * 0.3048
+)
+
+# plot with depth labels
+fig, ax = plt.subplots(figsize=(8, 6))
+
+ax.imshow(
+    Moccasin_dem,
+    cmap="terrain",
+    extent=[left, right, bottom, top_raster]
+)
+
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2)
+
+gwic_gdf[gwic_gdf["usable"] == "Yes"].plot(
+    ax=ax, color="lime", markersize=40, label="Yes"
+)
+
+gwic_gdf[gwic_gdf["usable"] == "Maybe"].plot(
+    ax=ax, color="orange", markersize=30, label="Maybe"
+)
+
+gwic_gdf[gwic_gdf["usable"] == "No"].plot(
+    ax=ax, color="gray", markersize=15, label="No"
+)
+
+# label yes and maybe wells with depth in meters
+label_gdf = gwic_gdf[
+    gwic_gdf["usable"].isin(["Yes", "Maybe"]) &
+    gwic_gdf["Confining_layer_boundary_m"].notna()
+].copy()
+
+for _, row in label_gdf.iterrows():
+    x = row.geometry.x
+    y = row.geometry.y
+    depth_m = row["Confining_layer_boundary_m"]
+    
+    ax.text(
+        x,
+        y,
+        f"{depth_m:.1f} m",
+        fontsize=7,
+        color="black",
+        ha="left",
+        va="bottom"
+    )
+
+ax.legend()
+ax.set_title("GWIC Well Classification with Interpreted Boundary Depths")
+ax.set_aspect("equal")
+
+## save output for zooming 
+fig_out = model_ws / "GWIC_well_depths_map.png"
+plt.savefig(fig_out, dpi=300, bbox_inches="tight")
+
+plt.show()
+
+```
+
+
+```{python interpolated confining layer depth using GWIC wells}
+
+from scipy.interpolate import Rbf
+
+## only use yes and maybe wells 
+interp_wells = gwic_gdf[
+    gwic_gdf["usable"].isin(["Yes", "Maybe"]) &
+    gwic_gdf["Confining_layer_boundary_m"].notna()
+].copy()
+
+## find well locations and depths
+x = interp_wells.geometry.x.values
+y = interp_wells.geometry.y.values
+z = interp_wells["Confining_layer_boundary_m"].values
+
+## predict depth at cell centers
+xcenters = modelgrid.xcellcenters
+ycenters = modelgrid.ycellcenters
+
+# RBF interpolation strategy (smoother)
+rbf = Rbf(
+    x, y, z,
+    function="linear",   # stable first choice
+    smooth=2.0           # increase for smoother surface
+)
+
+## interpolate onto cell centers across grid
+confining_depth_m = rbf(xcenters, ycenters)
+
+# keep interpolated depths within observed range
+zmin = np.nanmin(z)
+zmax = np.nanmax(z)
+
+confining_depth_m = np.clip(
+    confining_depth_m,
+    zmin,
+    zmax
+)
+
+# mask outside active domain
+confining_depth_active = np.where(
+    idomain[0] == 1,
+    confining_depth_m,
+    np.nan
+)
+
+# Plot smoothed surface
+fig, ax = plt.subplots(figsize=(8, 6))
+
+pmv = flopy.plot.PlotMapView(modelgrid=modelgrid, ax=ax)
+quad = pmv.plot_array(confining_depth_active)
+pmv.plot_grid(alpha=0.05)
+
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2)
+
+interp_wells.plot(
+    ax=ax,
+    column="usable",
+    categorical=True,
+    markersize=40,
+    legend=True,
+    legend_kwds={"loc": "lower right"}
+)
+
+plt.colorbar(quad, ax=ax, label="Interpreted confining depth (m)")
+ax.set_title("Smoothed Interpolated Confining Layer Depth: Yes + Maybe Wells")
+ax.set_aspect("equal")
+
+fig_out = model_ws / "smoothed_confining_depth_yes_maybe.png"
+fig.savefig(fig_out, dpi=300, bbox_inches="tight")
+
+plt.show()
+
+fig_out
+
+botm_interp = top_dis - confining_depth_m
+
+```
+
+```{python interpolated bottom elevation from GWIC wells}
+
+# Build interpolated bottom surface from Yes + Maybe
+botm_interp = np.zeros((nlay, nrow, ncol), dtype=float)
+
+# bottom = top - depth
+botm_interp[0] = top_dis - confining_depth_m
+
+# mask for plotting
+botm_interp_active = np.where(idomain[0] == 1, botm_interp[0], np.nan)
+
+# checking for values greater than top
+bad_cells = botm_interp[0] >= top_dis
+print("Cells where bottom >= top:", bad_cells.sum())
+
+# Plot interpolated bottom elevation
+fig, ax = plt.subplots(figsize=(8, 6))
+
+pmv = flopy.plot.PlotMapView(modelgrid=modelgrid, ax=ax)
+quad = pmv.plot_array(botm_interp_active)
+pmv.plot_grid(alpha=0.05)
+
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2)
+
+plt.colorbar(quad, ax=ax, label="Bottom elevation (m)")
+ax.set_title("Interpolated Model Bottom: Yes + Maybe Wells")
+ax.set_aspect("equal")
+
+fig_out = model_ws / "interpolated_model_bottom_yes_maybe.png"
+fig.savefig(fig_out, dpi=300, bbox_inches="tight")
+
+plt.show()
+
+fig_out
+
+```
+
+
+```{python interpolated confining layer depth using GWIC wells (yes only)}
+
+# Smooth interpolation using YES wells only
+interp_wells_yes = gwic_gdf[
+    (gwic_gdf["usable"] == "Yes") &
+    gwic_gdf["Confining_layer_boundary_m"].notna()
+].copy()
+
+print("Yes interpolation wells:", len(interp_wells_yes))
+
+x = interp_wells_yes.geometry.x.values
+y = interp_wells_yes.geometry.y.values
+z = interp_wells_yes["Confining_layer_boundary_m"].values
+
+xcenters = modelgrid.xcellcenters
+ycenters = modelgrid.ycellcenters
+
+rbf_yes = Rbf(
+    x, y, z,
+    function="linear",
+    smooth=2.0
+)
+
+confining_depth_m_yes = rbf_yes(xcenters, ycenters)
+
+zmin = np.nanmin(z)
+zmax = np.nanmax(z)
+
+confining_depth_m_yes = np.clip(
+    confining_depth_m_yes,
+    zmin,
+    zmax
+)
+
+confining_depth_active_yes = np.where(
+    idomain[0] == 1,
+    confining_depth_m_yes,
+    np.nan
+)
+
+
+# Plot YES-only interpolated surface
+fig, ax = plt.subplots(figsize=(8, 6))
+
+pmv = flopy.plot.PlotMapView(modelgrid=modelgrid, ax=ax)
+quad = pmv.plot_array(confining_depth_active_yes)
+pmv.plot_grid(alpha=0.05)
+
+boundary.boundary.plot(ax=ax, color="red", linewidth=1)
+flowlines_clip.plot(ax=ax, color="blue", linewidth=1.2)
+
+interp_wells_yes.plot(
+    ax=ax,
+    color="lime",
+    edgecolor="black",
+    markersize=45,
+    label="Yes"
+)
+
+plt.colorbar(quad, ax=ax, label="Interpreted confining depth (m)")
+ax.legend(loc="lower right")
+ax.set_title("Smoothed Interpolated Confining Layer Depth: Yes Wells Only")
+ax.set_aspect("equal")
+
+fig_out = model_ws / "smoothed_confining_depth_yes_only.png"
+fig.savefig(fig_out, dpi=300, bbox_inches="tight")
+
+plt.show()
+
+fig_out
+
+```
+
+# Aquifer discharge calculations
+```{python aquifer discharge calculations}
+# Calculate terrace boundary area
+
+print("Boundary CRS:", boundary.crs)
+
+# Reproject to an appropriate projected CRS if necessary
+if boundary.crs.is_geographic:
+    # Use UTM zone appropriate for the study area
+    boundary_area = boundary.to_crs(boundary.estimate_utm_crs())
+else:
+    boundary_area = boundary
+
+area_m2 = boundary_area.geometry.area.sum()
+
+print(f"Terrace boundary area: {area_m2:,.2f} m²")
+print(f"Terrace boundary area: {area_m2 / 1_000_000:,.4f} km²")
+print(f"Terrace boundary area: {area_m2 / 4046.8564224:,.2f} acres")
+
+
+## making some assumptions about the aquifer here from previous work
+## mainly Sigler et al. 2018 
+
+## assuming effective porosity of 0.35 and using Sigler's 3.6m saturated thickness
+## estimate to give us a 1.26 m water height in the terrace aquifer
+
+# 3. Estimate saturated aquifer volume
+
+effective_porosity = 0.35
+aquifer_material_depth_m = 3.6 # m
+saturated_height_m =   effective_porosity * aquifer_material_depth_m # m
+
+# Plan-view aquifer volume
+saturated_aquifer_volume_m3 = area_m2 * saturated_height_m
+
+# Water volume estimate
+water_volume_m3 = area_m2 * saturated_height_m
+
+print(f"Equivalent water height: {saturated_height_m:.2f} m")
+print(f"Water volume: {water_volume_m3:,.2f} m³")
+
+# 4. Estimate turnover flow
+
+turnover_years = 20
+
+annual_turnover_m3 = water_volume_m3 / turnover_years
+daily_turnover_m3 = annual_turnover_m3 / 365.25
+
+print(f"20-year annual turnover: {annual_turnover_m3:,.2f} m³/year")
+print(f"20-year daily turnover: {daily_turnover_m3:,.2f} m³/day")
+```
+
+# Model simulation construction
+```{python building simulation}
+
+## Build final MF6 simulation
+
+# Simulation
+
+sim = flopy.mf6.MFSimulation(
+    sim_name="moccasin",
+    version="mf6",
+    exe_name=r"D:\MODFLOW6\mf6.7.0_win64\bin\mf6.exe",
+    sim_ws=str(model_ws),
+)
+
+# Stress periods
+
+tdis = flopy.mf6.ModflowTdis(
+    sim,
+    time_units="DAYS",
+    nper=1,
+    perioddata=[(1.0, 1, 1.0)],
+)
+
+# Solver
+
+ims = flopy.mf6.ModflowIms(
+    sim,
+    print_option="SUMMARY",
+    complexity="SIMPLE",
+)
+
+# Groundwater flow model
+
+gwf = flopy.mf6.ModflowGwf(
+    sim,
+    modelname="moccasin",
+    save_flows=True,
+)
+
+# Structured grid
+
+dis = flopy.mf6.ModflowGwfdis(
+    gwf,
+    nlay=nlay,
+    nrow=nrow,
+    ncol=ncol,
+    delr=delr,
+    delc=delc,
+    top=top_dis,
+    botm=botm_interp, # interpolated bottom
+    idomain=idomain,
+    xorigin=xmin,
+    yorigin=ymin,
+)
+
+
+# Initial conditions
+
+strt = np.minimum( 
+    botm_interp + saturated_height_m,
+    top_dis - 0.01
+)
+
+ic = flopy.mf6.ModflowGwfic(
+    gwf,
+    strt=strt,
+)
+
+# Hydraulic properties
+
+k_horiz = 10     # m/day
+k_vert = 1       # m/day, common assumption for alluvial aquifers
+
+npf = flopy.mf6.ModflowGwfnpf(
+    gwf,
+    icelltype=1,
+    k=k_horiz,
+    k33=k_vert,
+    save_specific_discharge=True,
+)
+
+
+# Output control
+
+oc = flopy.mf6.ModflowGwfoc(
+    gwf,
+    head_filerecord="moccasin.hds",
+    budget_filerecord="moccasin.cbc",
+    saverecord=[("HEAD", "ALL"), ("BUDGET", "ALL")],
+    printrecord=[("HEAD", "LAST"), ("BUDGET", "LAST")],
+)
+
+## head of Red shed lake needed for chd package
+## https://myfwp.mt.gov/fishMT/waterbody/42338
+lake_head = 4544.2 * 0.3048 ## conversion from feet to meters, 
+
+print(f"Red Shed Lake CHD head: {lake_head:.3f} m")
+
+## quick sanity check 
+# Check Red Shed Lake CHD cells
+
+print(f"Red Shed Lake CHD head: {lake_head:.3f} m")
+
+for cellid in lake_cells:
+    _, r, c = cellid
+
+    print(
+        f"Cell ({r}, {c}) | "
+        f"top = {top_dis[r,c]:.3f} m | "
+        f"bottom = {botm_interp[0,r,c]:.3f} m | "
+        f"CHD = {lake_head:.3f} m | "
+        f"active = {idomain[0,r,c]}"
+    )
+    
+## based on the information I am seeing with the top elevations being
+## lower than the given lake elevation value, I am updating the lake elevation
+## https://www.anyplaceamerica.com/directory/mt/judith-basin-county-30045/lakes/red-shed-lake-775661/
+## which lists the elevation as 4514 ft
+
+lake_head = 4514 * 0.3048 ## conversion from feet to meters, updated elevation
+
+for cellid in lake_cells:
+    _, r, c = cellid
+
+    print(
+        f"Cell ({r}, {c}) | "
+        f"top = {top_dis[r,c]:.3f} m | "
+        f"bottom = {botm_interp[0,r,c]:.3f} m | "
+        f"CHD = {lake_head:.3f} m | "
+        f"active = {idomain[0,r,c]}"
+    )
+
+## setting hydraulic head to lake_head elevation in previously defined lake cells
+chd_spd = [
+    (cellid, lake_head)
+    for cellid in lake_cells
+]
+
+chd = flopy.mf6.ModflowGwfchd(
+    gwf,
+    stress_period_data=chd_spd,
+    save_flows=True,
+)
+
+```
+
+# CHD simulation
+```{python CHD only simulation run}
+
+# CHD-only diagnostic run
+# No recharge and no drainage for this diagnostic test.
+# Red Shed Lake is the only hydraulic boundary condition.
+
+ims = flopy.mf6.ModflowIms(
+    sim,
+    print_option="ALL",
+    complexity="SIMPLE",
+    outer_maximum=100,
+    outer_dvclose=1e-4,
+    inner_maximum=200,
+    inner_dvclose=1e-5,
+)
+
+# Write and run model
+sim.write_simulation()
+
+success, buff = sim.run_simulation(
+    silent=False,
+    report=True
+)
+
+print("SUCCESS:", success)
+
+# Plot CHD-only heads if model converged
+
+if success:
+
+    hds = flopy.utils.HeadFile(
+        model_ws / "moccasin.hds"
+    )
+
+    head = hds.get_data(
+        kstpkper=(0, 0)
+    )
+
+    head_active = np.where(
+        idomain[0] == 1,
+        head[0],
+        np.nan
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    pmv = flopy.plot.PlotMapView(
+        model=gwf,
+        ax=ax
+    )
+
+    quad = pmv.plot_array(head_active)
+
+    levels = np.linspace(
+        np.nanmin(head_active),
+        np.nanmax(head_active),
+        12
+    )
+
+    contours = ax.contour(
+        modelgrid.xcellcenters,
+        modelgrid.ycellcenters,
+        head_active,
+        levels=levels,
+        colors="black",
+        linewidths=0.7
+    )
+
+    ax.clabel(
+        contours,
+        inline=True,
+        fontsize=8
+    )
+
+    # Red Shed Lake
+    red_shed_lake.boundary.plot(
+        ax=ax,
+        color="blue",
+        linewidth=1.5,
+        label="Red Shed Lake"
+    )
+
+    # Moccasin Terrace boundary
+    boundary.boundary.plot(
+        ax=ax,
+        color="red",
+        linewidth=1,
+        label="Moccasin boundary"
+    )
+
+    # M1 well
+    well_gdf.plot(
+        ax=ax,
+        color="orange",
+        edgecolor="black",
+        markersize=60,
+        label="Monitoring well"
+    )
+
+    plt.colorbar(
+        quad,
+        ax=ax,
+        label="Simulated head (m)"
+    )
+
+    ax.set_title(
+        "CHD-Only Simulated Heads — Red Shed Lake"
+    )
+
+    ax.set_aspect("equal")
+    ax.legend()
+
+    plt.show()
+```
+What we can see from this plot setup is that with only one CHD value and one very 
+close to the surrounding DEM surface, we get only one simulated starting head
+across the terrace. An expected result. Now we could add a constant head at the 
+M1 monitoring well but given we want to predict groundwater flow in this area,
+I am not inclined to do that. GWIC static water level data from well construction 
+logs are from many different dates and years and are thus unsuitable. 
+
+For these reasons I am moving to a simple sensitivity test using reasonable 
+recharge and discharge tests to see how that could impact hydraulic head gradients
+around the M1 monitoring well. 
+
+# Recharge and discharge (in development)
+
+This next code sections are still under development. 
+
+```{python recharge and discharge added (in development)}
+
+# Add recharge + drainage to working CHD model
+
+# DRN package from NHD flowlines
+
+ix = GridIntersect(modelgrid)
+
+drn_result = ix.intersect(
+    flowlines_clip.geometry.union_all()
+)
+
+drn_spd = []
+
+drn_cond = 2.5  # m2/day per DRN cell, first test value
+
+for cellid in drn_result.cellids:
+
+    r, c = cellid
+
+    # First-pass stream/drain elevation
+    drain_elev = top_dis[r, c] - 1.0
+
+    if idomain[0, r, c] == 1:
+
+        drn_spd.append(
+            ((0, r, c), drain_elev, drn_cond)
+        )
+
+print(f"DRN cells: {len(drn_spd)}")
+print(f"DRN conductance per cell: {drn_cond:.2f} m²/day")
+print(
+    f"Total nominal DRN conductance: "
+    f"{len(drn_spd) * drn_cond:,.2f} m²/day"
+)
+
+drn = flopy.mf6.ModflowGwfdrn(
+    gwf,
+    stress_period_data=drn_spd,
+    save_flows=True,
+)
+
+# Recharge package
+
+annual_precip_m = 0.40
+recharge_fraction = 0.10
+
+annual_recharge_m = (
+    annual_precip_m * recharge_fraction
+)
+
+rch_rate = (
+    annual_recharge_m / 365.25 ## per day value
+)
+
+print(f"Annual precipitation: {annual_precip_m:.2f} m/year")
+print(f"Assumed recharge fraction: {recharge_fraction:.0%}")
+print(f"Annual recharge: {annual_recharge_m:.3f} m/year")
+print(f"MODFLOW recharge rate: {rch_rate:.3e} m/day")
+
+rch = flopy.mf6.ModflowGwfrcha(
+    gwf,
+    recharge=rch_rate,
+)
+
+# Run CHD + RCH + DRN model
+
+sim.write_simulation()
+
+success, buff = sim.run_simulation(
+    silent=False,
+    report=True
+)
+
+print("SUCCESS:", success)
+
+
+## reading listing file for troubleshooting 
+
+lst_path = model_ws / "mfsim.lst"
+
+if lst_path.exists():
+
+    with open(lst_path, "r", errors="ignore") as f:
+        lst_lines = f.readlines()
+
+    print("=" * 80)
+    print("LAST 150 LINES OF mfsim.lst")
+    print("=" * 80)
+
+    for line in lst_lines[-150:]:
+        print(line.rstrip())
+```
